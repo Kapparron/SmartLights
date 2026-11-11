@@ -1,0 +1,95 @@
+name: Publicar APK
+
+# El nombre de cada ejecución dice qué versión publica.
+run-name: Publicar versión ${{ inputs.version }}
+
+# Se lanza a mano desde la pestaña Actions. La rama la elige el propio
+# desplegable de GitHub, así que aquí solo se pregunta la versión.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Versión (por ejemplo 0.1.0)
+        required: true
+        type: string
+      prerelease:
+        description: Marcar como preliminar
+        required: false
+        default: false
+        type: boolean
+
+# Una publicación a la vez: dos a la vez se pisarían al crear la etiqueta.
+concurrency:
+  group: release-apk
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # El último paso crea la release y sube el APK con el token del propio flujo.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Preparar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # El SDK de Android ya viene en el ejecutor de GitHub (ANDROID_HOME).
+      - name: Preparar Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Sin una clave fija, cada APK saldría con una firma distinta y Android no
+      # dejaría actualizar de una versión a otra. Falla antes que publicar así.
+      - name: Recuperar la clave de firma
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Faltan los secretos de firma (KEYSTORE_BASE64, KEYSTORE_PASSWORD y KEY_ALIAS). Mira docs/DESARROLLO.md."
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/smartlights.p12"
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/smartlights.p12" >> "$GITHUB_ENV"
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+
+      # El número de ejecución sirve de versionCode: Android solo exige que crezca.
+      - name: Compilar el APK
+        run: |
+          ./gradlew :app:assembleRelease --no-daemon \
+            -PappVersion="${VERSION#v}" \
+            -PappVersionCode="$RUN_NUMBER"
+        working-directory: android
+        env:
+          VERSION: ${{ inputs.version }}
+          RUN_NUMBER: ${{ github.run_number }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+
+      - name: Comprobar la firma y el paquete
+        run: |
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" verify --print-certs "$APK" | grep -E "Signer #1 certificate SHA-256"
+          "$BT/aapt2" dump badging "$APK" | grep -E "^package:"
+
+      - name: Renombrar el APK
+        run: mv android/app/build/outputs/apk/release/app-release.apk "smartlights-${{ inputs.version }}.apk"
+
+      # La etiqueta se crea sobre el commit que se acaba de compilar.
+      - name: Publicar la release
+        run: |
+          gh release create "$VERSION" "smartlights-$VERSION.apk" \
+            --target "$GITHUB_SHA" \
+            --title "SmartLights $VERSION" \
+            --generate-notes \
+            $PRERELEASE
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease && '--prerelease' || '' }}

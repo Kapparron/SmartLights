@@ -10,3 +10,7 @@ local.properties
 *.keystore
 tapo.json
 config.json
+*.p12
+*.pem
+*.b64
+password.txt

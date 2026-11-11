@@ -32,6 +32,34 @@ la clave de depuración: sirve para instalarlo en tu móvil, no para publicarlo.
 El identificador de la app es `com.smartlights.app`. Si lo cambias, Android la
 tratará como otra app distinta y perderás los datos guardados.
 
+## Publicar una release
+
+El APK se compila y se publica desde GitHub: pestaña **Actions → Publicar APK →
+Run workflow**. Pide la versión (por ejemplo `0.1.0`) y si es preliminar; compila
+el APK firmado, crea la etiqueta y sube la release con el APK adjunto.
+
+La firma necesita una clave fija. Sin ella, cada APK saldría con una firma
+distinta y Android no dejaría actualizar de una versión a otra. Se guarda en tres
+**secretos del repositorio** (Settings → Secrets and variables → Actions):
+
+| Secreto | Qué es |
+|---|---|
+| `KEYSTORE_BASE64` | El almacén de claves (`.p12`) en base64 |
+| `KEYSTORE_PASSWORD` | Su contraseña |
+| `KEY_ALIAS` | El alias de la clave |
+
+Para crear la clave (necesita `openssl`):
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 10000 -nodes -subj "/CN=SmartLights"
+openssl pkcs12 -export -inkey key.pem -in cert.pem -name smartlights -out smartlights.p12
+base64 -w0 smartlights.p12      # contenido de KEYSTORE_BASE64
+```
+
+> **Guarda el `.p12` y su contraseña fuera del repo.** Si los pierdes, no podrás
+> publicar actualizaciones que se instalen sobre las anteriores. Y no los subas
+> nunca: `*.p12`, `*.jks` y `*.keystore` están en `.gitignore`.
+
 ## Probar el núcleo desde el PC
 
 ```bash
