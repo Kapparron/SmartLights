@@ -1,0 +1,12 @@
+# Compilados y cachés
+build/
+.gradle/
+*.apk
+*.aab
+# Rutas locales del SDK
+local.properties
+# Credenciales: nunca al repositorio
+*.jks
+*.keystore
+tapo.json
+config.json
