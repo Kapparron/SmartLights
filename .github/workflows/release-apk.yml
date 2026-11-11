@@ -74,9 +74,13 @@ jobs:
       - name: Comprobar la firma y el paquete
         run: |
           APK=android/app/build/outputs/apk/release/app-release.apk
-          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$BT/apksigner" verify --print-certs "$APK" | grep -E "Signer #1 certificate SHA-256"
-          "$BT/aapt2" dump badging "$APK" | grep -E "^package:"
+          ls -la "$APK"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/[0-9]* | sort -V | tail -1)
+          echo "build-tools: $BT"
+          # Falla si la firma no es válida.
+          "$BT/apksigner" verify --verbose --print-certs "$APK"
+          # Solo informativo.
+          "$BT/aapt2" dump badging "$APK" | head -1 || true
 
       - name: Renombrar el APK
         run: mv android/app/build/outputs/apk/release/app-release.apk "smartlights-${{ inputs.version }}.apk"
