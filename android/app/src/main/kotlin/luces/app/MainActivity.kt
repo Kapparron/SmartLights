@@ -140,7 +140,7 @@ class MainActivity : Activity() {
         paintTabs(pager.page)
 
         // botón flotante
-        val fab = circleButton("+", 60, cAccent, cOnAccent, 32f) { if (pager.page == 1) groupSheet(null) else showAddMenu(it) }
+        val fab = circleButton("+", 60, cAccent, cOnAccent, 32f) { if (pager.page == 1) groupSheet(null) else addLightSheet() }
         fab.elevation = dp(10).toFloat()
         rootFrame.addView(fab, FrameLayout.LayoutParams(dp(60), dp(60), Gravity.BOTTOM or Gravity.END).apply {
             setMargins(0, 0, dp(22), dp(26))
@@ -847,61 +847,6 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------ menús y hojas
-    /** Menú del botón «+»: tarjeta flotante sobre el botón, con icono y descripción por opción. */
-    private fun showAddMenu(fab: View) {
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = rounded(cSurface, 22, stroke = cStroke)
-            setPadding(dp(6), dp(6), dp(6), dp(6))
-            alpha = 0f
-        }
-        // margen alrededor de la tarjeta para que quepa su sombra dentro de la ventana
-        val holder = FrameLayout(this).apply { setPadding(dp(12), dp(12), dp(12), dp(12)); addView(card, MATCH_PARENT, WRAP_CONTENT) }
-        val popup = PopupWindow(holder, dp(300), WRAP_CONTENT, true).apply {
-            setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
-            isOutsideTouchable = true
-        }
-        card.elevation = dp(14).toFloat()
-
-        fun item(kind: Int, tint: Int, title: String, sub: String, action: () -> Unit): View {
-            val row = LinearLayout(this).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(10), dp(10), dp(14), dp(10))
-            }
-            val icon = FrameLayout(this).apply { background = rounded((tint and 0x00FFFFFF) or 0x33000000, 99) }
-            icon.addView(GlyphView(this, kind, tint), FrameLayout.LayoutParams(dp(44), dp(44)))
-            row.addView(icon, LinearLayout.LayoutParams(dp(44), dp(44)))
-            val texts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, 0, 0) }
-            texts.addView(TextView(this).apply { text = title; textSize = 16f; setTextColor(cText); typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL) })
-            texts.addView(TextView(this).apply { text = sub; textSize = 12.5f; setTextColor(cMuted); setPadding(0, dp(2), 0, 0) })
-            row.addView(texts, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-            row.setOnTouchListener { v, e ->
-                when (e.action) {
-                    MotionEvent.ACTION_DOWN -> v.background = rounded(Color.parseColor("#1AFFFFFF"), 16)
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> v.background = null
-                }
-                false
-            }
-            row.setOnClickListener { popup.dismiss(); action() }
-            return row
-        }
-
-        card.addView(item(0, cAccent, "Añadir bombilla WiZ", "Busca las bombillas de tu red") { discover() })
-        card.addView(View(this).apply { setBackgroundColor(cStroke) }, LinearLayout.LayoutParams(MATCH_PARENT, dp(1)).apply { marginStart = dp(68); marginEnd = dp(12) })
-        card.addView(item(1, Color.parseColor("#4FD1C5"), "Añadir bombilla Tapo", "Las busca solas con tu cuenta de Tapo") { addTapoSheet() })
-
-        fab.animate().rotation(45f).setDuration(180).start()
-        popup.setOnDismissListener { fab.animate().rotation(0f).setDuration(180).start() }
-        // justo encima del botón (margen derecho del botón 22 dp + 12 dp de holgura de sombra)
-        popup.showAtLocation(rootFrame, Gravity.BOTTOM or Gravity.END, dp(10), dp(26 + 60 + 6 - 12))
-        card.post {
-            card.pivotX = card.width.toFloat(); card.pivotY = card.height.toFloat()
-            card.scaleX = 0.85f; card.scaleY = 0.85f; card.translationY = dp(14).toFloat()
-            card.animate().alpha(1f).scaleX(1f).scaleY(1f).translationY(0f).setDuration(180)
-                .setInterpolator(android.view.animation.DecelerateInterpolator()).start()
-        }
-    }
-
     private fun showCardMenu(anchor: View, l: Light) {
         val pm = PopupMenu(this, anchor, Gravity.END)
         if (l is Tapo) pm.menu.add(0, 3, 0, "Programaciones")
@@ -919,7 +864,8 @@ class MainActivity : Activity() {
     }
 
     private fun field(hint: String, type: Int, text: String = ""): EditText = EditText(this).apply {
-        this.hint = hint; inputType = type; setText(text); setSingleLine()
+        this.hint = hint; setSingleLine(); inputType = type; setText(text)  // setSingleLine antes: después anula el ocultado de contraseña
+        importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
         setTextColor(cText); setHintTextColor(cMuted); textSize = 16f
         background = rounded(cSurface2, 14)
         setPadding(dp(16), dp(14), dp(16), dp(14))
@@ -958,17 +904,44 @@ class MainActivity : Activity() {
         return d
     }
 
-    private fun addTapoSheet() {
+    /** Menú único de alta: se elige el modelo (WiZ / Tapo) y se buscan las bombillas de la red. */
+    private fun addLightSheet() {
+        var model = "WiZ"
         val ip = field("IP de la Tapo (opcional: vacío = buscar sola)", InputType.TYPE_CLASS_PHONE)
         val user = field("Email de la cuenta Tapo", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS)
         val pass = field("Contraseña de Tapo", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
         val msg = TextView(this).apply { textSize = 13f; setTextColor(cDanger); visibility = View.GONE }
+        val info = TextView(this).apply { textSize = 13f; setTextColor(cMuted) }
+        val tapoForm = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(ip, lp(14)); addView(user, lp()); addView(pass, lp())
+        }
+        val chips = LinearLayout(this)
+        val chipViews = ArrayList<TextView>()
+        fun paint() {
+            chipViews.forEach { c ->
+                val sel = c.text.toString() == model
+                c.setTextColor(if (sel) cOnAccent else cText)
+                c.background = if (sel) rounded(cAccent, 99) else rounded(Color.TRANSPARENT, 99, stroke = cStroke, strokeDp = 1)
+            }
+            val tapo = model == "Tapo"
+            tapoForm.visibility = if (tapo) View.VISIBLE else View.GONE
+            info.text = if (tapo) "Se buscan las Tapo de tu red. La contraseña se guarda cifrada en este móvil."
+            else "Se buscan por la red todas las bombillas WiZ. No hace falta nada más."
+            msg.visibility = View.GONE
+        }
+        listOf("WiZ", "Tapo").forEach { m ->
+            val c = pill(m, filled = false) { model = m; paint() }
+            chipViews += c
+            chips.addView(c, LinearLayout.LayoutParams(0, dp(42), 1f).apply { if (m == "WiZ") marginEnd = dp(10) })
+        }
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(TextView(context).apply { text = "Se buscan las Tapo de tu red. La contraseña se guarda cifrada en este móvil."; textSize = 13f; setTextColor(cMuted) })
-            addView(ip, lp(14)); addView(user, lp()); addView(pass, lp()); addView(msg, lp(12))
+            addView(chips); addView(info, lp(14)); addView(tapoForm); addView(msg, lp(12))
         }
-        sheet("Añadir bombillas Tapo", form, "Buscar y añadir") { dismiss, btn ->
+        paint()
+        sheet("Añadir bombilla", form, "Buscar") { dismiss, btn ->
+            if (model == "WiZ") { dismiss(); discover(); return@sheet }
             val host = ip.text.toString().trim()
             val u = user.text.toString().trim()
             val pw = pass.text.toString()
@@ -990,7 +963,7 @@ class MainActivity : Activity() {
                 }
                 ui.post {
                     if (ok.isEmpty()) {
-                        btn.text = "Buscar y añadir"; btn.isEnabled = true
+                        btn.text = "Buscar"; btn.isEnabled = true
                         msg.text = fallo ?: if (cand.isEmpty()) "No se encontró ninguna Tapo en la red" else "No hay Tapo nuevas"
                         msg.visibility = View.VISIBLE
                     } else {
