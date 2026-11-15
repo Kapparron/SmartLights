@@ -168,8 +168,8 @@ class MainActivity : Activity() {
                     o.has("password") -> { migrar = true; o.getString("password") }  // formato antiguo en claro
                     else -> ""
                 }
-                Tapo(o.getString("id"), o.getString("name"), o.getString("host"), o.optString("username"), pass)
-            } else Wiz(o.getString("id"), o.getString("name"), o.getString("host"))
+                Tapo(o.getString("id"), o.getString("name"), o.getString("host"), o.optString("username"), pass, o.optString("mac").ifEmpty { null })
+            } else Wiz(o.getString("id"), o.getString("name"), o.getString("host"), o.optString("mac").ifEmpty { null })
         }
         if (migrar) saveLights()  // reescribe con la contraseña cifrada
     }
@@ -178,6 +178,8 @@ class MainActivity : Activity() {
         val arr = JSONArray()
         lights.forEach {
             val o = JSONObject().put("id", it.id).put("name", it.name).put("host", it.host).put("type", it.kind)
+            if (it is Wiz) it.mac?.let { m -> o.put("mac", m) }
+            if (it is Tapo) it.mac?.let { m -> o.put("mac", m) }
             if (it is Tapo) o.put("username", it.username).put("password_enc", SecretStore.encrypt(it.password))
             arr.put(o)
         }
@@ -229,13 +231,45 @@ class MainActivity : Activity() {
         for (l in lights.toList()) {
             if (!inFlight.add(l.id)) continue
             io.execute {
+                val macAntes = (l as? Wiz)?.mac ?: (l as? Tapo)?.mac
                 val r = runCatching { l.state() }
                 ui.post {
                     inFlight.remove(l.id)
+                    if (((l as? Wiz)?.mac ?: (l as? Tapo)?.mac) != macAntes) saveLights()  // aprende la MAC de bombillas antiguas
+                    if (r.isFailure) relocate()
                     cards[l.id]?.let { c -> r.fold({ c.bind(it) }, { e -> c.showError(e.message ?: "Sin respuesta") }) }
                     updateSummary()
                     updateGroups()
                 }
+            }
+        }
+    }
+
+    private var relocating = false
+    private var lastRelocate = 0L
+
+    /** Si una WiZ no responde, puede que el router le haya dado otra IP: rebusca y la reubica por MAC. */
+    private fun relocate() {
+        val now = System.currentTimeMillis()
+        if (relocating || now - lastRelocate < 15000) return
+        relocating = true; lastRelocate = now
+        io.execute {
+            val found = runCatching { Wiz.discoverMacs() }.getOrDefault(emptyMap())
+            val tapoFound = if (lights.any { it is Tapo }) runCatching { Tapo.discover() }.getOrDefault(emptyMap()) else emptyMap()
+            ui.post {
+                relocating = false
+                var cambio = false
+                for (l in lights) {
+                    val t = l as? Tapo ?: continue
+                    val ip = t.mac?.let { tapoFound[it] } ?: continue
+                    if (ip != t.host) { t.moveTo(ip); cambio = true }
+                }
+                for (l in lights) {
+                    val w = l as? Wiz ?: continue
+                    val ip = w.mac?.let { found[it] } ?: continue
+                    if (ip != w.host) { w.host = ip; cambio = true; cards[w.id]?.light = w }
+                }
+                if (cambio) { saveLights(); syncCards(); refresh() }
             }
         }
     }
@@ -286,11 +320,15 @@ class MainActivity : Activity() {
     private fun discover() {
         snack("Buscando bombillas WiZ…")
         io.execute {
-            val ips = runCatching { Wiz.discover() }.getOrDefault(emptyList())
+            val found = runCatching { Wiz.discoverMacs() }.getOrDefault(emptyMap())
+            val ips = found.values.toList()
             ui.post {
-                val nuevas = ips.filter { ip -> lights.none { it.host == ip } }
-                nuevas.forEach { lights += Wiz(it, "WiZ ${lights.size + 1}", it) }
-                if (nuevas.isNotEmpty()) { saveLights(); syncCards(); refresh() }
+                // bombillas ya guardadas que cambiaron de IP: se actualizan en vez de duplicarse
+                found.forEach { (mac, ip) -> lights.filterIsInstance<Wiz>().firstOrNull { it.mac == mac }?.host = ip }
+                val nuevas = found.filter { (mac, ip) -> lights.none { it.host == ip || (it as? Wiz)?.mac == mac } }
+                nuevas.forEach { (mac, ip) -> lights += Wiz(ip, "WiZ ${lights.size + 1}", ip, mac.takeIf { it != ip }) }
+                saveLights()
+                syncCards(); refresh()
                 snack(if (nuevas.isEmpty()) "No hay bombillas nuevas (${ips.size} encontradas)" else "Añadidas ${nuevas.size} bombillas")
             }
         }
@@ -850,7 +888,7 @@ class MainActivity : Activity() {
 
         card.addView(item(0, cAccent, "Añadir bombilla WiZ", "Busca las bombillas de tu red") { discover() })
         card.addView(View(this).apply { setBackgroundColor(cStroke) }, LinearLayout.LayoutParams(MATCH_PARENT, dp(1)).apply { marginStart = dp(68); marginEnd = dp(12) })
-        card.addView(item(1, Color.parseColor("#4FD1C5"), "Añadir bombilla Tapo", "Con su IP y tu cuenta de Tapo") { addTapoSheet() })
+        card.addView(item(1, Color.parseColor("#4FD1C5"), "Añadir bombilla Tapo", "Las busca solas con tu cuenta de Tapo") { addTapoSheet() })
 
         fab.animate().rotation(45f).setDuration(180).start()
         popup.setOnDismissListener { fab.animate().rotation(0f).setDuration(180).start() }
@@ -921,32 +959,43 @@ class MainActivity : Activity() {
     }
 
     private fun addTapoSheet() {
-        val ip = field("IP de la Tapo (p. ej. 192.168.1.50)", InputType.TYPE_CLASS_PHONE)
+        val ip = field("IP de la Tapo (opcional: vacío = buscar sola)", InputType.TYPE_CLASS_PHONE)
         val user = field("Email de la cuenta Tapo", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS)
         val pass = field("Contraseña de Tapo", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
         val msg = TextView(this).apply { textSize = 13f; setTextColor(cDanger); visibility = View.GONE }
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(TextView(context).apply { text = "La contraseña se guarda cifrada en este móvil."; textSize = 13f; setTextColor(cMuted) })
+            addView(TextView(context).apply { text = "Se buscan las Tapo de tu red. La contraseña se guarda cifrada en este móvil."; textSize = 13f; setTextColor(cMuted) })
             addView(ip, lp(14)); addView(user, lp()); addView(pass, lp()); addView(msg, lp(12))
         }
-        sheet("Añadir bombilla Tapo", form, "Añadir") { dismiss, btn ->
+        sheet("Añadir bombillas Tapo", form, "Buscar y añadir") { dismiss, btn ->
             val host = ip.text.toString().trim()
-            val t = Tapo("tapo-$host", "Tapo", host, user.text.toString().trim(), pass.text.toString())
-            if (host.isEmpty() || t.username.isEmpty() || t.password.isEmpty()) {
-                msg.text = "Rellena los tres campos"; msg.visibility = View.VISIBLE; return@sheet
+            val u = user.text.toString().trim()
+            val pw = pass.text.toString()
+            if (u.isEmpty() || pw.isEmpty()) {
+                msg.text = "Rellena el email y la contraseña"; msg.visibility = View.VISIBLE; return@sheet
             }
-            btn.text = "Conectando…"; btn.isEnabled = false; msg.visibility = View.GONE
+            btn.text = if (host.isEmpty()) "Buscando…" else "Conectando…"; btn.isEnabled = false; msg.visibility = View.GONE
             io.execute {
-                val e = runCatching { t.state() }.exceptionOrNull()
+                // IP manual -> una candidata sin MAC conocida; si no, escaneo de la red
+                val cand: Map<String, String> =
+                    if (host.isNotEmpty()) mapOf(host to host) else runCatching { Tapo.discover() }.getOrDefault(emptyMap())
+                val nuevas = cand.filter { (mac, ip) -> lights.none { it.host == ip || (it as? Tapo)?.mac == mac } }
+                val ok = mutableListOf<Tapo>()
+                var fallo: String? = null
+                for ((mac, addr) in nuevas) {
+                    val t = Tapo("tapo-$mac", "Tapo ${lights.size + ok.size + 1}", addr, u, pw, mac.takeIf { it != addr })
+                    val e = runCatching { t.state() }.exceptionOrNull()
+                    if (e == null) ok += t else fallo = e.message ?: "No se pudo conectar"
+                }
                 ui.post {
-                    if (e != null) {
-                        btn.text = "Añadir"; btn.isEnabled = true
-                        msg.text = e.message ?: "No se pudo conectar"; msg.visibility = View.VISIBLE
+                    if (ok.isEmpty()) {
+                        btn.text = "Buscar y añadir"; btn.isEnabled = true
+                        msg.text = fallo ?: if (cand.isEmpty()) "No se encontró ninguna Tapo en la red" else "No hay Tapo nuevas"
+                        msg.visibility = View.VISIBLE
                     } else {
-                        lights.removeAll { it.host == t.host }
-                        lights += t; saveLights(); syncCards(); refresh()
-                        dismiss(); snack("Tapo añadida")
+                        lights += ok; saveLights(); syncCards(); refresh()
+                        dismiss(); snack("Añadidas ${ok.size} Tapo")
                     }
                 }
             }
@@ -959,7 +1008,7 @@ class MainActivity : Activity() {
             val nuevo = input.text.toString().trim().ifBlank { l.name }
             val i = lights.indexOf(l)
             if (i >= 0) {
-                lights[i] = if (l is Tapo) Tapo(l.id, nuevo, l.host, l.username, l.password) else Wiz(l.id, nuevo, l.host)
+                lights[i] = if (l is Tapo) Tapo(l.id, nuevo, l.host, l.username, l.password, l.mac) else Wiz(l.id, nuevo, l.host, (l as? Wiz)?.mac)
                 saveLights(); syncCards()
             }
             dismiss()
