@@ -23,6 +23,8 @@ class TpapSession(private val host: String, private val username: String, privat
     private var key: ByteArray? = null
     private var baseNonce: ByteArray? = null
     private var seq = 0L
+    /** MAC anunciada por la bombilla en el último handshake. */
+    @Volatile var lastMac: String? = null
 
     private fun b64(b: ByteArray) = Base64.getEncoder().encodeToString(b)
     private fun unb64(s: String) = Base64.getDecoder().decode(s)
@@ -67,6 +69,7 @@ class TpapSession(private val host: String, private val username: String, privat
         port = 80
         val disc = login(JSONObject().put("sub_method", "discover"), "discover")
         val mac = disc.optString("mac")
+        lastMac = mac.takeIf { it.isNotEmpty() }
         val tpap = disc.optJSONObject("tpap") ?: throw TapoException("Tapo no anuncia TPAP")
         val tls = tpap.optInt("tls", -1)
         if (tls == 1 || tls == 2) throw TapoException("Esta Tapo exige TLS (tls=$tls), aún no soportado")

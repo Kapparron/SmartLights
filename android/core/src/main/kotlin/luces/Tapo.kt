@@ -6,15 +6,27 @@ import org.json.JSONObject
 class Tapo(
     override val id: String,
     override val name: String,
-    override val host: String,
+    host: String,
     val username: String,
     val password: String,
+    /** MAC (minúsculas, con ':'): identidad estable aunque cambie la IP. */
+    @Volatile var mac: String? = null,
 ) : Light {
     override val kind = "Tapo"
-    private val session = TpapSession(host, username, password)
+    @Volatile override var host: String = host
+        private set
+    @Volatile private var session = TpapSession(host, username, password)
+
+    /** La bombilla cambió de IP: reconecta contra la nueva. */
+    fun moveTo(ip: String) {
+        session.reset()
+        host = ip
+        session = TpapSession(ip, username, password)
+    }
 
     override fun state(): LightState {
         val r = session.request("get_device_info", null).getJSONObject("result")
+        session.lastMac?.let { mac = normMac(it) }
         val hasColor = r.has("hue") && r.has("saturation")
         val range = r.optJSONArray("color_temp_range")?.let { it.getInt(0)..it.getInt(1) }
         val ct = r.optInt("color_temp", 0)
@@ -89,6 +101,49 @@ class Tapo(
     override fun close() = session.reset()
 
     companion object {
+        fun normMac(m: String) = m.lowercase().replace('-', ':')
+
+        /** IPv4 local (sin bucle) y su prefijo; null si no hay red. */
+        private fun localNet(): Pair<ByteArray, Int>? =
+            java.net.NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { it.interfaceAddresses }
+                .firstOrNull { it.address is java.net.Inet4Address && it.address.isSiteLocalAddress }
+                ?.let { it.address.address to it.networkPrefixLength.toInt() }
+
+        /**
+         * Busca Tapo recorriendo la subred (máx. /24) con la petición `discover` de TPAP, que no pide credenciales.
+         * Devuelve MAC -> IP.
+         */
+        fun discover(): Map<String, String> {
+            val (addr, _) = localNet() ?: return emptyMap()
+            val found = java.util.concurrent.ConcurrentHashMap<String, String>()
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(48)
+            val body = """{"method":"login","params":{"sub_method":"discover"}}""".toByteArray()
+            for (i in 1..254) {
+                if (i == (addr[3].toInt() and 0xFF)) continue
+                val ip = "${addr[0].toInt() and 0xFF}.${addr[1].toInt() and 0xFF}.${addr[2].toInt() and 0xFF}.$i"
+                pool.execute {
+                    runCatching {
+                        java.net.Socket().use { it.connect(java.net.InetSocketAddress(ip, 80), 600) }
+                        val c = java.net.URL("http://$ip:80/").openConnection() as java.net.HttpURLConnection
+                        try {
+                            c.requestMethod = "POST"; c.doOutput = true
+                            c.connectTimeout = 1500; c.readTimeout = 2500
+                            c.setRequestProperty("Content-Type", "application/json")
+                            c.outputStream.use { it.write(body) }
+                            val res = JSONObject(c.inputStream.use { String(it.readBytes()) }).optJSONObject("result")
+                            val mac = res?.optString("mac").orEmpty()
+                            if (res != null && mac.isNotEmpty() && res.has("tpap")) found[normMac(mac)] = ip
+                        } finally { c.disconnect() }
+                    }
+                }
+            }
+            pool.shutdown()
+            pool.awaitTermination(40, java.util.concurrent.TimeUnit.SECONDS)
+            return found.toMap()
+        }
+
         fun hsvToRgb(h: Int, s: Int): IntArray {
             val sat = s / 100.0
             val hh = (h % 360) / 60.0

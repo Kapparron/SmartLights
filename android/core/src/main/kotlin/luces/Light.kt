@@ -37,7 +37,13 @@ interface Light {
 
 class WizException(msg: String) : Exception(msg)
 
-class Wiz(override val id: String, override val name: String, override val host: String) : Light {
+class Wiz(
+    override val id: String,
+    override val name: String,
+    @Volatile override var host: String,
+    /** MAC de la bombilla: identidad estable aunque el router le cambie la IP. */
+    @Volatile var mac: String? = null,
+) : Light {
     override val kind = "WiZ"
     private var color: Boolean? = null
 
@@ -78,6 +84,7 @@ class Wiz(override val id: String, override val name: String, override val host:
             }
         }
         val r = rpc("getPilot").getJSONObject("result")
+        r.optString("mac").takeIf { it.isNotEmpty() }?.let { mac = it.lowercase() }
         val rgb = if (r.has("r")) intArrayOf(r.getInt("r"), r.getInt("g"), r.getInt("b")) else null
         return LightState(
             on = r.optBoolean("state"),
@@ -102,8 +109,11 @@ class Wiz(override val id: String, override val name: String, override val host:
         const val PORT = 38899
 
         /** Busca bombillas WiZ por broadcast UDP. Devuelve IPs. */
-        fun discover(timeoutMs: Int = 2000): List<String> {
-            val found = linkedSetOf<String>()
+        fun discover(timeoutMs: Int = 2000): List<String> = discoverMacs(timeoutMs).values.toList()
+
+        /** Como [discover] pero devuelve MAC -> IP (la MAC puede ser "" si la bombilla no la envía). */
+        fun discoverMacs(timeoutMs: Int = 2000): Map<String, String> {
+            val found = linkedMapOf<String, String>()
             val msg = """{"method":"getPilot","params":{}}""".toByteArray()
             DatagramSocket().use { s ->
                 s.broadcast = true
@@ -115,12 +125,16 @@ class Wiz(override val id: String, override val name: String, override val host:
                     try {
                         val p = DatagramPacket(buf, buf.size)
                         s.receive(p)
-                        found += p.address.hostAddress!!
+                        val ip = p.address.hostAddress!!
+                        val mac = runCatching {
+                            JSONObject(String(p.data, 0, p.length)).getJSONObject("result").optString("mac")
+                        }.getOrDefault("").lowercase()
+                        found[mac.ifEmpty { ip }] = ip
                     } catch (e: SocketTimeoutException) {
                     }
                 }
             }
-            return found.toList()
+            return found
         }
     }
 }
